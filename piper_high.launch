@@ -1,0 +1,19 @@
+<launch>
+  <arg name="startup_reset" default="true" />
+  <group ns="piper_test">
+    <node name="piper_basic_grasp" pkg="piper" type="piper_ctrl_single_node.py" output="screen" launch-prefix="/usr/bin/python3">
+      <param name="can_port" value="can_piper_high" />
+      <param name="auto_enable" value="false" />
+      <param name="read_only" value="false" />
+      <param name="gripper_exist" value="true" />
+      <param name="gripper_command_in_motion" value="false" />
+      <param name="gripper_on_arm_enable" value="false" />
+    </node>
+    <node if="$(arg startup_reset)" name="startup_reset" pkg="piper"
+          type="piper_startup_reset.py" output="screen" launch-prefix="/usr/bin/python3">
+      <param name="can_interface" value="can_piper_high" />
+      <param name="pose_name" value="high_zero" />
+      <param name="speed_percent" value="10" />
+    </node>
+  </group>
+</launch>

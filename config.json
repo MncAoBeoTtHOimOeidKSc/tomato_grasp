@@ -1,0 +1,123 @@
+{
+  "observation_pose_mm_deg": [
+    225.23000000000002,
+    0.019,
+    391.618,
+    175.75,
+    47.298,
+    177.161
+  ],
+  "work_surface_z_mm": null,
+  "grasp_yaw_deg": -177.856,
+  "handeye_path": "~/robot_project/VLM-to-Robot/00_Dual_Arm/calibration/results/T_ee_cam_high.npy",
+  "tcp_offset_ee_mm": [
+    0.0,
+    0.0,
+    110.59
+  ],
+  "target_offset_base_mm": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "tcp_workspace_mm": [
+    [
+      80,
+      650
+    ],
+    [
+      -220,
+      220
+    ],
+    [
+      null,
+      540
+    ]
+  ],
+  "link6_workspace_mm": [
+    [
+      50,
+      650
+    ],
+    [
+      -240,
+      240
+    ],
+    [
+      60,
+      650
+    ]
+  ],
+  "tcp_surface_clearance_mm": 8.0,
+  "hover_mm": 100.0,
+  "lift_mm": 100.0,
+  "max_move_mm": 450.0,
+  "servo_step_mm": 8.0,
+  "servo_gain": 0.65,
+  "servo_xy_tolerance_mm": 4.0,
+  "servo_max_steps": 12,
+  "servo_timeout_s": 45.0,
+  "lock_frames": 6,
+  "verify_frames": 3,
+  "jitter_mm": 6.0,
+  "reassociate_mm": 45.0,
+  "sample_timeout_s": 8.0,
+  "arm_speed_percent": 10,
+  "fine_speed_percent": 5,
+  "motion_timeout_s": 20.0,
+  "gripper_open_mm": 65.0,
+  "gripper_close_mm": 5.0,
+  "gripper_effort": 500,
+  "camera": {
+    "serial": "317622073937",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "min_depth_m": 0.07,
+    "max_depth_m": 1.0,
+    "warmup_frames": 30
+  },
+  "target": {
+    "name": "red_object",
+    "min_area_px": 300,
+    "morphology_kernel": 5,
+    "mask_erode_px": 3,
+    "max_track_distance_px": 120,
+    "max_track_depth_m": 0.15,
+    "hsv_ranges": [
+      {
+        "lower": [
+          0,
+          90,
+          60
+        ],
+        "upper": [
+          12,
+          255,
+          255
+        ]
+      },
+      {
+        "lower": [
+          168,
+          90,
+          60
+        ],
+        "upper": [
+          179,
+          255,
+          255
+        ]
+      }
+    ]
+  },
+  "can_interface": "can_piper_high",
+  "observation_joints_deg": [
+    -1.235,
+    64.557,
+    -68.003,
+    3.943,
+    51.144,
+    -1.387
+  ]
+}
