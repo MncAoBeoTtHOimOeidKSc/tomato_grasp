@@ -35,6 +35,10 @@ def project_base_point(point_mm, pose, handeye, intrinsics):
     return int(round(u)), int(round(v))
 
 
+class EmptyGrasp(RuntimeError):
+    """The arm completed its lift and the gripper confirmed an empty close."""
+
+
 class Grasp:
     def __init__(self, cfg, arm, camera_factory, record, check_cancel, clock=time.monotonic):
         self.cfg, self.arm, self.camera_factory = cfg, arm, camera_factory
@@ -49,15 +53,10 @@ class Grasp:
     def tcp_for_pose(self, pose):
         return np.asarray(pose[:3]) + rotation(pose[3:]) @ self.offset
 
-    def require_box(self, xyz, key):
-        if not np.isfinite(xyz).all() or any(
-                (lo is not None and v < lo) or v > hi for v, (lo, hi) in zip(xyz, self.cfg[key])):
-            raise RuntimeError(key.upper() + ': ' + str(list(xyz)))
-
     def validate_pose(self, pose):
-        self.require_box(pose[:3], 'link6_workspace_mm')
+        if np.shape(pose) != (6,) or not np.isfinite(pose).all():
+            raise RuntimeError('INVALID_ARM_POSE')
         tcp = self.tcp_for_pose(pose)
-        self.require_box(tcp, 'tcp_workspace_mm')
         surface_z = self.cfg.get('work_surface_z_mm')
         if surface_z is not None and tcp[2] < surface_z + self.cfg['tcp_surface_clearance_mm']:
             raise RuntimeError('TCP_BELOW_CONFIGURED_SURFACE_CLEARANCE')
@@ -122,67 +121,67 @@ class Grasp:
             raise RuntimeError('SERVO_TIMEOUT')
         return tcp, target
 
-    def realign_xy(self, hover_z):
-        cfg = self.cfg
-        anchor = self.stable_target(cfg['lock_frames'], self.clock() + cfg['sample_timeout_s'])
-        bias = np.asarray(cfg['target_offset_base_mm'])
-        target = anchor + bias
-        tcp = self.aligned_height_tcp(hover_z)
-        error = target[:2] - tcp[:2]
-        distance = float(np.linalg.norm(error))
-        self.record('servo_measurement', error_xy_mm=error.tolist(), target_mm=target.tolist())
-        if distance <= cfg['servo_xy_tolerance_mm']:
-            return tcp, target
-        goal = self.pose_for_tcp(np.r_[target[:2], hover_z])
-        self.validate_pose(goal)
-        # Keep the old maximum total correction while sending a single setpoint.
-        if distance > cfg['servo_step_mm'] * cfg['servo_max_steps']:
-            raise RuntimeError('REALIGN_DISTANCE_EXCEEDED: {:.1f} mm'.format(distance))
-        self.move('servo_xy', goal, fine=True, vertical=True)
-
-        target = self.stable_target(cfg['verify_frames'], self.clock() + cfg['sample_timeout_s'], anchor) + bias
-        tcp = self.aligned_height_tcp(hover_z)
-        error = target[:2] - tcp[:2]
-        self.record('servo_measurement', error_xy_mm=error.tolist(), target_mm=target.tolist())
-        residual = float(np.linalg.norm(error))
-        if residual > cfg['servo_xy_tolerance_mm']:
-            raise RuntimeError('REALIGN_RESIDUAL_OUT_OF_TOLERANCE: {:.1f} mm'.format(residual))
-        return tcp, target
-
     def run(self, align_only=False, on_aligned=None):
+        attempts = 1 if align_only else 2
+        for attempt in range(1, attempts + 1):
+            self.record('grasp_attempt', attempt=attempt)
+            feedback = self._attempt(align_only, on_aligned)
+            if align_only:
+                return
+            opened, held = feedback
+            effort_change = abs(held['effort']) - abs(opened['effort'])
+            width_error = held['width_mm'] - self.cfg['gripper_close_mm']
+            loaded = effort_change >= .20
+            if loaded and width_error > 2.:
+                outcome = 'contact_detected'
+            elif not loaded and abs(width_error) <= 2.:
+                outcome = 'empty'
+            else:
+                outcome = 'uncertain'
+            self.record('grasp_checked', attempt=attempt, outcome=outcome, open_feedback=opened,
+                        hold_feedback=held, effort_change=effort_change)
+            if outcome == 'contact_detected':
+                return held
+            if outcome == 'uncertain':
+                raise RuntimeError('GRIPPER_CONTACT_UNCERTAIN')
+            if attempt < attempts:
+                self.record('grasp_retry', reason='empty', next_attempt=attempt + 1)
+        raise EmptyGrasp('GRASP_EMPTY_AFTER_RETRY')
+
+    def _attempt(self, align_only, on_aligned):
         cfg = self.cfg
-        if not align_only and cfg.get('work_surface_z_mm') is None:
-            raise ValueError('WORK_SURFACE_HEIGHT_REQUIRED_FOR_GRASP')
         self.move('observe', np.asarray(cfg['observation_pose_mm_deg']))
         self.check_cancel()
         self.camera = self.camera_factory()
         try:
-            bias = np.asarray(cfg['target_offset_base_mm'])
+            descent_mm = 110.
             anchor = self.stable_target(cfg['lock_frames'], self.clock() + cfg['sample_timeout_s'])
             # The coarse waypoint is directly above the detected surface in base coordinates.
             hover = anchor + [0, 0, cfg['hover_mm']]
-            # Full grasps also validate the estimated contact point before approaching.
+            # Check configured table clearance before approaching.
             if not align_only:
-                self.validate_pose(self.pose_for_tcp(anchor + bias))
+                self.validate_pose(self.pose_for_tcp(hover - [0, 0, descent_mm]))
             self.record('hover_planned', target_base_mm=anchor.tolist(), tcp_base_mm=hover.tolist())
             self.move('hover', self.pose_for_tcp(hover), vertical=True)
             tcp, target = self.align_xy(anchor, hover[2])
+            self.record('alignment_verified', error_xy_mm=float(np.linalg.norm(target[:2] - tcp[:2])))
             if align_only:
                 if on_aligned is not None:
                     on_aligned(self.camera, hover[2])
                 return
-            # Freeze aligned XY and depth for the final vertical-only move.
-            descent = np.r_[tcp[:2], target[2]]
+            # Measure the fixed drop from the actual settled TCP after alignment.
+            descent = tcp - [0, 0, descent_mm]
             lift = descent + [0, 0, cfg['lift_mm']]
-            if not cfg['hover_mm']/2 <= tcp[2] - descent[2] <= cfg['hover_mm'] + cfg['reassociate_mm']:
-                raise RuntimeError('DESCENT_DISTANCE_OUT_OF_RANGE')
             for point in (descent, lift):
                 self.validate_pose(self.pose_for_tcp(point))
             self.check_cancel()
+            self.record('descent_planned', distance_mm=descent_mm, tcp_base_mm=descent.tolist())
             self.arm.grip('open', cfg['gripper_open_mm'])
+            opened = self.arm.grip_feedback()
             self.move('descend', self.pose_for_tcp(descent), fine=True, vertical=True)
             self.check_cancel()
             self.arm.grip('close', cfg['gripper_close_mm'], contact=True)
             self.move('lift', self.pose_for_tcp(lift), fine=True, vertical=True)
+            return opened, self.arm.grip_feedback()
         finally:
             self.camera.close()

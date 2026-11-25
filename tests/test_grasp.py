@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 
 import numpy as np
-from grasp import Grasp, base_point, rotation, rotation_distance
+from grasp import EmptyGrasp, Grasp, base_point, rotation, rotation_distance
 from main import validate_config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +13,7 @@ class FakeArm:
     def __init__(self):
         self.current = np.array([250., 0., 400., 175., 30., 175.])
         self.calls = []
+        self.hold_feedback = iter([dict(width_mm=22.05, effort=-.521)])
 
     def pose(self):
         return self.current.copy()
@@ -23,6 +24,13 @@ class FakeArm:
 
     def grip(self, name, width, contact=False):
         self.calls.append((name, width, contact))
+
+    def grip_feedback(self):
+        if self.calls[-1][0] == 'open':
+            return dict(width_mm=64.19, effort=.069)
+        if self.calls[-1][0] == 'lift':
+            return next(self.hold_feedback)
+        raise AssertionError('Unexpected feedback timing')
 
 
 class FakeCamera:
@@ -46,7 +54,8 @@ class GraspTests(unittest.TestCase):
         counter = iter(np.arange(0, 500, .1))
         camera = FakeCamera(arm, None if point is None else np.array(point, dtype=float))
         def start_camera():
-            self.assertEqual([c[0] for c in arm.calls], ['observe'])
+            self.assertEqual(arm.calls[-1][0], 'observe')
+            camera.closed = False
             return camera
         g = Grasp(cfg, arm, start_camera, lambda *a, **kw: None, lambda: None, lambda: next(counter))
         return cfg, arm, camera, g
@@ -68,6 +77,7 @@ class GraspTests(unittest.TestCase):
             self.assertLessEqual(np.linalg.norm(current-prev), cfg['servo_step_mm']+1e-6)
             prev = current
         descend = g.tcp_for_pose(arm.calls[-3][1])
+        self.assertAlmostEqual(prev[2]-descend[2], 110.)
         lift = g.tcp_for_pose(arm.calls[-1][1])
         np.testing.assert_allclose(descend[:2], lift[:2])
         self.assertLessEqual(np.linalg.norm(descend[:2]-camera.point[:2]), cfg['servo_xy_tolerance_mm'])
@@ -75,13 +85,53 @@ class GraspTests(unittest.TestCase):
         self.assertTrue(arm.calls[-2][2])
         self.assertTrue(camera.closed)
 
-    def test_hover_outside_workspace_is_not_dispatched(self):
-        cfg, arm, camera, g = self.setup_run()
-        camera.before_hover[2] = cfg["link6_workspace_mm"][2][1] - cfg["hover_mm"] + 1.
-        with self.assertRaisesRegex(RuntimeError, "LINK6_WORKSPACE_MM|TCP_WORKSPACE_MM"):
-            g.run(align_only=True)
-        self.assertEqual([c[0] for c in arm.calls], ['observe'])
+    def test_empty_gripper_reobserves_once_then_accepts_contact(self):
+        _, arm, camera, g = self.setup_run()
+        arm.hold_feedback = iter([dict(width_mm=5.11, effort=-.132),
+                                  dict(width_mm=22.05, effort=-.521)])
+        self.assertEqual(g.run()['width_mm'], 22.05)
+        names = [c[0] for c in arm.calls]
+        self.assertEqual(names.count('observe'), 2)
+        self.assertEqual(names.count('lift'), 2)
+        self.assertEqual(names[names.index('lift') + 1], 'observe')
         self.assertTrue(camera.closed)
+
+    def test_empty_retry_limit(self):
+        _, arm, _, g = self.setup_run()
+        arm.hold_feedback = iter([dict(width_mm=5.11, effort=-.132)] * 2)
+        with self.assertRaisesRegex(EmptyGrasp, 'GRASP_EMPTY_AFTER_RETRY'):
+            g.run()
+        self.assertEqual([c[0] for c in arm.calls].count('observe'), 2)
+
+    def test_inconclusive_close_does_not_retry(self):
+        _, arm, _, g = self.setup_run()
+        arm.hold_feedback = iter([dict(width_mm=22.05, effort=-.132)])
+        with self.assertRaisesRegex(RuntimeError, 'GRIPPER_CONTACT_UNCERTAIN'):
+            g.run()
+        self.assertEqual([c[0] for c in arm.calls].count('observe'), 1)
+
+    def test_stale_gripper_feedback_does_not_retry(self):
+        _, arm, _, g = self.setup_run()
+        read = arm.grip_feedback
+
+        def fail_after_lift():
+            if arm.calls[-1][0] == 'lift':
+                raise RuntimeError('GRIPPER_FEEDBACK_STALE')
+            return read()
+
+        arm.grip_feedback = fail_after_lift
+        with self.assertRaisesRegex(RuntimeError, 'GRIPPER_FEEDBACK_STALE'):
+            g.run()
+        self.assertEqual([c[0] for c in arm.calls].count('observe'), 1)
+
+    def test_negative_link6_descent_is_forwarded_to_driver(self):
+        target = [486.53, -19.78, -136.37]
+        cfg, arm, camera, g = self.setup_run(target)
+        cfg['work_surface_z_mm'] = None
+        camera.before_hover[:] = camera.point
+        g.run()
+        self.assertEqual([call[0] for call in arm.calls][-4:], ['open', 'descend', 'close', 'lift'])
+        self.assertAlmostEqual(arm.calls[-3][1][2], -35.78)
 
     def test_negative_tcp_hover_is_allowed_but_surface_clearance_still_applies(self):
         cfg, arm, camera, g = self.setup_run([478.28, 18.07, -146.25])
@@ -101,67 +151,38 @@ class GraspTests(unittest.TestCase):
         self.assertTrue(all(c[0] in ('observe','hover','servo_xy') for c in arm.calls))
         self.assertTrue(camera.closed)
 
-    def test_realign_relocks_moved_target_without_changing_height_or_gripper(self):
+    def test_failed_servo_never_opens_gripper(self):
         cfg, arm, camera, g = self.setup_run()
+        cfg['servo_max_steps'] = 1
+        move = arm.move
 
-        def after_alignment(active_camera, hover_z):
-            self.assertIs(active_camera, camera)
-            self.assertFalse(camera.closed)
-            start = len(arm.calls)
-            camera.point = np.array([416., 40., 55.])
-            tcp, target = g.realign_xy(hover_z)
-            self.assertLessEqual(np.linalg.norm(tcp[:2] - target[:2]), cfg['servo_xy_tolerance_mm'])
-            self.assertEqual(len(arm.calls), start + 1)
-            for name, pose, fine in arm.calls[start:]:
-                self.assertEqual(name, 'servo_xy')
-                self.assertTrue(fine)
-                self.assertAlmostEqual(g.tcp_for_pose(pose)[2], hover_z)
-                np.testing.assert_allclose(pose[3:], g.rpy)
+        def miss_servo(name, pose, fine):
+            if name == 'servo_xy':
+                arm.calls.append((name, pose.copy(), fine))
+            else:
+                move(name, pose, fine)
 
-        g.run(align_only=True, on_aligned=after_alignment)
+        arm.move = miss_servo
+        with self.assertRaisesRegex(RuntimeError, 'SERVO_STEP_LIMIT'):
+            g.run()
+        self.assertEqual([c[0] for c in arm.calls], ['observe', 'hover', 'servo_xy'])
         self.assertTrue(camera.closed)
 
-    def test_realign_unstable_or_out_of_bounds_target_does_not_dispatch(self):
-        _, arm, camera, g = self.setup_run()
-
-        def after_alignment(active_camera, hover_z):
-            start = len(arm.calls)
-            for point, error in ((None, 'TARGET_LOST_OR_UNSTABLE'),
-                                 (np.array([680., 25., 44.]), 'LINK6_WORKSPACE_MM'),
-                                 (np.array([500., 25., 44.]), 'REALIGN_DISTANCE_EXCEEDED')):
-                active_camera.point = point
-                with self.assertRaisesRegex(RuntimeError, error):
-                    g.realign_xy(hover_z)
-                self.assertEqual(len(arm.calls), start)
-                self.assertFalse(active_camera.closed)
-
-        g.run(align_only=True, on_aligned=after_alignment)
-
-    def test_realign_residual_does_not_send_another_command(self):
-        _, arm, camera, g = self.setup_run()
-
-        def after_alignment(active_camera, hover_z):
-            camera.point = np.array([416., 40., 55.])
-            start = len(arm.calls)
-            move = arm.move
-
-            def move_then_shift_target(name, pose, fine):
-                move(name, pose, fine)
-                camera.point = camera.point + [10., 0., 0.]
-
-            arm.move = move_then_shift_target
-            with self.assertRaisesRegex(RuntimeError, 'REALIGN_RESIDUAL_OUT_OF_TOLERANCE'):
-                g.realign_xy(hover_z)
-            self.assertEqual(len(arm.calls), start + 1)
-
-        g.run(align_only=True, on_aligned=after_alignment)
-
-    def test_full_grasp_without_surface_height_cannot_move(self):
-        cfg, arm, _, g = self.setup_run()
+    def test_full_grasp_without_surface_height_uses_fixed_drop_from_feedback(self):
+        cfg, arm, camera, g = self.setup_run((350, 20, 49))
         cfg['work_surface_z_mm'] = None
-        with self.assertRaisesRegex(ValueError, 'WORK_SURFACE_HEIGHT_REQUIRED_FOR_GRASP'):
-            g.run()
-        self.assertEqual(arm.calls, [])
+        move = arm.move
+
+        def move_with_hover_tracking_error(name, pose, fine):
+            move(name, pose, fine)
+            if name == 'hover':
+                arm.current[2] += 2.
+
+        arm.move = move_with_hover_tracking_error
+        g.run()
+        self.assertEqual([c[0] for c in arm.calls][-4:], ['open', 'descend', 'close', 'lift'])
+        np.testing.assert_allclose(g.tcp_for_pose(arm.calls[-3][1]), [350, 20, 37])
+        self.assertTrue(camera.closed)
 
     def test_lost_or_different_target_stops_before_opening(self):
         for point in (None, [410., 20., 45.]):
@@ -173,9 +194,10 @@ class GraspTests(unittest.TestCase):
 
     def test_low_pick_is_rejected_without_opening(self):
         _, arm, camera, g = self.setup_run([350., 20., 15.])
+        camera.before_hover[:] = camera.point
         with self.assertRaisesRegex(RuntimeError, 'SURFACE_CLEARANCE'):
             g.run()
-        self.assertEqual([c[0] for c in arm.calls], ['observe', 'hover'])
+        self.assertEqual([c[0] for c in arm.calls], ['observe'])
         self.assertTrue(camera.closed)
 
     def test_failed_move_does_not_grip_or_lift(self):

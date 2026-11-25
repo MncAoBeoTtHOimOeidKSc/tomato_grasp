@@ -20,34 +20,6 @@
     0.0,
     0.0
   ],
-  "tcp_workspace_mm": [
-    [
-      80,
-      650
-    ],
-    [
-      -220,
-      220
-    ],
-    [
-      null,
-      540
-    ]
-  ],
-  "link6_workspace_mm": [
-    [
-      50,
-      650
-    ],
-    [
-      -240,
-      240
-    ],
-    [
-      60,
-      650
-    ]
-  ],
   "tcp_surface_clearance_mm": 8.0,
   "hover_mm": 100.0,
   "lift_mm": 100.0,

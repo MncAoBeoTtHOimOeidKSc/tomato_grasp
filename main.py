@@ -11,7 +11,7 @@ import threading
 import time
 
 import numpy as np
-from grasp import Grasp, base_point, project_base_point, rotation_distance
+from grasp import EmptyGrasp, Grasp, base_point, project_base_point, rotation_distance
 
 ROOT = Path(__file__).resolve().parent
 TOOLS = Path.home()/'piper_ws/src/piper_ros/local_tools'
@@ -36,23 +36,8 @@ def validate_config(cfg, align_only=False):
     vector('observation_pose_mm_deg', 6)
     vector('tcp_offset_ee_mm', 3)
     vector('target_offset_base_mm', 3)
-    for key in ('tcp_workspace_mm', 'link6_workspace_mm'):
-        box = cfg[key]
-        if not isinstance(box, list) or len(box) != 3 or any(
-                not isinstance(pair, list) or len(pair) != 2 for pair in box):
-            raise ValueError('INVALID_' + key.upper())
-        for axis, (lo, hi) in enumerate(box):
-            if type(hi) not in (int, float) or not np.isfinite(hi):
-                raise ValueError('INVALID_' + key.upper())
-            if lo is None and key == 'tcp_workspace_mm' and axis == 2:
-                continue
-            if type(lo) not in (int, float) or not np.isfinite(lo) or lo >= hi:
-                raise ValueError('INVALID_' + key.upper())
     surface_z = cfg.get('work_surface_z_mm')
-    if surface_z is None:
-        if not align_only:
-            raise ValueError('WORK_SURFACE_HEIGHT_REQUIRED_FOR_GRASP')
-    elif type(surface_z) not in (int, float) or not -200 <= surface_z <= 500:
+    if surface_z is not None and (type(surface_z) not in (int, float) or not -200 <= surface_z <= 500):
         raise ValueError('INVALID_WORK_SURFACE_Z_MM')
     for key, low, high in (
         ('grasp_yaw_deg', -180, 180),
@@ -264,14 +249,12 @@ def run_hardware(args, cfg, handeye):
                 record('preview_closed')
                 return
 
-            post_dispatch_failure = False
-
             class Arm:
                 def pose(self):
                     return pose_mm(seq.check())
 
                 def move(self, name, target, fine):
-                    nonlocal commanded, post_dispatch_failure
+                    nonlocal commanded
                     check_cancel()
                     record('step_start', step=name, pose_mm_deg=target.tolist())
                     status, code, effect = arm.move_end_pose(**dict(zip(
@@ -281,7 +264,6 @@ def run_hardware(args, cfg, handeye):
                     commanded |= effect.get('command_sent') is True
                     record('step_result', step=name, status=status, error_code=code, effect=effect)
                     if status != 'SUCCEEDED' or effect.get('stopped') is not True:
-                        post_dispatch_failure |= effect.get('command_sent') is True
                         raise RuntimeError('{}: {}: {}'.format(name, code, effect.get('original_error', '')))
 
                 def grip(self, name, width, contact=False):
@@ -289,6 +271,24 @@ def run_hardware(args, cfg, handeye):
                     check_cancel()
                     commanded = True
                     seq.grip(name, width, contact=contact)
+
+                def grip_feedback(self):
+                    samples = []
+                    stamp = gripper_state(monitor)['stamp']
+                    deadline = time.monotonic() + 1.
+                    while time.monotonic() < deadline:
+                        seq.check()
+                        state = gripper_state(monitor)
+                        if not state['enabled']:
+                            raise RuntimeError('GRIPPER_NOT_ENABLED')
+                        if state['stamp'] > stamp:
+                            stamp = state['stamp']
+                            samples.append(state)
+                            if len(samples) == 5:
+                                return {key: float(np.median([s[key] for s in samples]))
+                                        for key in ('width_mm', 'effort')}
+                        time.sleep(.05)
+                    raise RuntimeError('GRIPPER_FEEDBACK_STALE')
 
             class Camera:
                 def __init__(self):
@@ -356,9 +356,9 @@ def run_hardware(args, cfg, handeye):
                     except RuntimeError:
                         return None
 
-                def show_aligned(self, realign):
+                def show_aligned(self):
                     window = 'tomato_grasp'
-                    message = 'Aligned | Move target, then press R'
+                    message = 'Alignment complete | Read-only preview'
                     while not (cancel.is_set() or rospy.is_shutdown()):
                         if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                             break
@@ -376,8 +376,6 @@ def run_hardware(args, cfg, handeye):
                         key = cv2.waitKey(1) & 0xff
                         if key in (27, ord('q'), ord('Q')):
                             break
-                        if key in (ord('r'), ord('R')) and not post_dispatch_failure:
-                            message = realign()
 
                 def close(self):
                     self.locator.stop()
@@ -388,41 +386,30 @@ def run_hardware(args, cfg, handeye):
             grasp.validate_pose(cfg['observation_pose_mm_deg'])
             # Start only with an already enabled arm in CAN mode. Do not change modes or enable here.
             seq.check(); gripper_state(monitor)
-            def record_completion():
+            def record_completion(hold_feedback=None):
                 record('complete', alignment_only=args.align_only, physical_grasp_success_verified=False,
-                       gripper=gripper_state(monitor))
+                       gripper_contact_detected=hold_feedback is not None,
+                       gripper=hold_feedback if hold_feedback is not None else gripper_state(monitor))
 
             def keep_alignment_preview(camera, hover_z):
                 record_completion()
                 record('alignment_preview_start')
 
-                def realign():
-                    record('realign_start', hover_z_mm=float(hover_z))
-                    try:
-                        arm.assert_commands_unblocked()
-                        tcp, target = grasp.realign_xy(hover_z)
-                    except RuntimeError as exc:
-                        if cancel.is_set() or rospy.is_shutdown():
-                            return 'Exiting'
-                        record('realign_failed', error=str(exc), preview_only=post_dispatch_failure)
-                        if post_dispatch_failure:
-                            return 'Motion fault | Preview only'
-                        return 'Not aligned | See terminal | R to try again'
-                    error = float(np.linalg.norm(target[:2] - tcp[:2]))
-                    record('realign_complete', error_xy_mm=error)
-                    return 'Aligned ({:.1f} mm) | Move target, then press R'.format(error)
-
                 try:
-                    camera.show_aligned(realign)
+                    camera.show_aligned()
                 except (cv2.error, RuntimeError, OSError) as exc:
                     record('alignment_preview_error', error=str(exc))
                 finally:
                     record('alignment_preview_closed')
 
             keep_preview = args.align_only and not args.no_display
-            grasp.run(align_only=args.align_only, on_aligned=keep_alignment_preview if keep_preview else None)
+            feedback = grasp.run(align_only=args.align_only,
+                                 on_aligned=keep_alignment_preview if keep_preview else None)
             if not keep_preview:
-                record_completion()
+                record_completion(feedback)
+        except EmptyGrasp as exc:
+            record('failed', error=str(exc), command_sent=commanded, stopped=True)
+            raise
         except BaseException as exc:
             record('failed', error=str(exc), command_sent=commanded)
             if commanded and arm is not None and not observation_settled:
@@ -456,12 +443,12 @@ def main():
     parser.add_argument('--config', type=Path, default=ROOT/'config.json')
     modes = parser.add_subparsers(dest='mode')
     check = modes.add_parser('check-config', help='validate geometry config offline')
-    check.add_argument('--align-only', action='store_true', help='validate without requiring a measured surface height')
+    check.add_argument('--align-only', action='store_true', help='compatibility option; surface height is optional in either mode')
     teach = modes.add_parser('record-observation', help='read stationary pose without motion')
     teach.add_argument('--save', action='store_true')
     preview = modes.add_parser('observe-red', help='move to observation joints and show red RGB-D preview')
     preview.add_argument('--execute', action='store_true')
-    run = modes.add_parser('run', help='execute one pickup')
+    run = modes.add_parser('run', help='align and automatically execute one pickup')
     run.add_argument('--execute', action='store_true')
     run.add_argument('--accept-model-tcp', action='store_true')
     run.add_argument('--no-display', action='store_true')
